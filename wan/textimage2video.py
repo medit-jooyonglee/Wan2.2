@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import time
 import types
 from contextlib import contextmanager
 from functools import partial
@@ -299,14 +300,15 @@ class WanTI2V:
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device) if guide_scale != 1.0 else None
             if offload_model:
                 self.text_encoder.model.cpu()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+            context_null = self.text_encoder([n_prompt], torch.device('cpu')) if guide_scale != 1.0 else None
             context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            if context_null is not None:
+                context_null = [t.to(self.device) for t in context_null]
 
         noise = [
             torch.randn(
@@ -379,11 +381,15 @@ class WanTI2V:
 
                 noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0]
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                if guide_scale == 1.0:
+                    # CFG-distilled checkpoints (for example TI2V-5B-Turbo)
+                    # need only the conditional pass.
+                    noise_pred = noise_pred_cond
+                else:
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0]
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -458,6 +464,28 @@ class WanTI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width (from max_area)
         """
+        profile_wall_start = time.perf_counter()
+        phase_profile = {}
+
+        def phase_start():
+            torch.cuda.synchronize(self.device)
+            torch.cuda.reset_peak_memory_stats(self.device)
+            return {
+                "started": time.perf_counter(),
+                "start_allocated_mib": torch.cuda.memory_allocated(self.device) / 2**20,
+                "start_reserved_mib": torch.cuda.memory_reserved(self.device) / 2**20,
+            }
+
+        def phase_end(state):
+            torch.cuda.synchronize(self.device)
+            return {
+                "elapsed_sec": round(time.perf_counter() - state["started"], 3),
+                "start_allocated_mib": round(state["start_allocated_mib"], 1),
+                "peak_allocated_mib": round(torch.cuda.max_memory_allocated(self.device) / 2**20, 1),
+                "start_reserved_mib": round(state["start_reserved_mib"], 1),
+                "peak_reserved_mib": round(torch.cuda.max_memory_reserved(self.device) / 2**20, 1),
+            }
+
         # preprocess
         ih, iw = img.height, img.width
         dh, dw = self.patch_size[1] * self.vae_stride[1], self.patch_size[
@@ -496,20 +524,25 @@ class WanTI2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        # preprocess
+        # Text encoding (CPU in the single-GPU server configuration).
+        phase = phase_start()
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
-            context_null = self.text_encoder([n_prompt], self.device)
+            context_null = self.text_encoder([n_prompt], self.device) if guide_scale != 1.0 else None
             if offload_model:
                 self.text_encoder.model.cpu()
         else:
             context = self.text_encoder([input_prompt], torch.device('cpu'))
-            context_null = self.text_encoder([n_prompt], torch.device('cpu'))
+            context_null = self.text_encoder([n_prompt], torch.device('cpu')) if guide_scale != 1.0 else None
             context = [t.to(self.device) for t in context]
-            context_null = [t.to(self.device) for t in context_null]
+            if context_null is not None:
+                context_null = [t.to(self.device) for t in context_null]
+        phase_profile["text_encoder"] = phase_end(phase)
 
+        phase = phase_start()
         z = self.vae.encode([img])
+        phase_profile["vae_encode"] = phase_end(phase)
 
         @contextmanager
         def noop_no_sync():
@@ -517,7 +550,8 @@ class WanTI2V:
 
         no_sync = getattr(self.model, 'no_sync', noop_no_sync)
 
-        # evaluation mode
+        # Scheduler setup, model transfer, and diffusion sampling.
+        phase = phase_start()
         with (
                 torch.amp.autocast('cuda', dtype=self.param_dtype),
                 torch.no_grad(),
@@ -581,12 +615,17 @@ class WanTI2V:
                     latent_model_input, t=timestep, **arg_c)[0]
                 if offload_model:
                     torch.cuda.empty_cache()
-                noise_pred_uncond = self.model(
-                    latent_model_input, t=timestep, **arg_null)[0]
-                if offload_model:
-                    torch.cuda.empty_cache()
-                noise_pred = noise_pred_uncond + guide_scale * (
-                    noise_pred_cond - noise_pred_uncond)
+                if guide_scale == 1.0:
+                    # CFG-distilled checkpoints (for example TI2V-5B-Turbo)
+                    # need only the conditional pass.
+                    noise_pred = noise_pred_cond
+                else:
+                    noise_pred_uncond = self.model(
+                        latent_model_input, t=timestep, **arg_null)[0]
+                    if offload_model:
+                        torch.cuda.empty_cache()
+                    noise_pred = noise_pred_uncond + guide_scale * (
+                        noise_pred_cond - noise_pred_uncond)
 
                 temp_x0 = sample_scheduler.step(
                     noise_pred.unsqueeze(0),
@@ -604,9 +643,12 @@ class WanTI2V:
                 self.model.cpu()
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+            phase_profile["diffusion_transformer"] = phase_end(phase)
 
             if self.rank == 0:
+                phase = phase_start()
                 videos = self.vae.decode(x0)
+                phase_profile["vae_decode"] = phase_end(phase)
 
         del noise, latent, x0
         del sample_scheduler
@@ -615,5 +657,15 @@ class WanTI2V:
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
+
+        profiled = sum(item["elapsed_sec"] for item in phase_profile.values())
+        total = time.perf_counter() - profile_wall_start
+        phase_profile["summary"] = {
+            "total_pipeline_sec": round(total, 3),
+            "profiled_phase_sec": round(profiled, 3),
+            "other_overhead_sec": round(max(0.0, total - profiled), 3),
+            "cuda_memory_note": "PyTorch allocator values; process VRAM from nvidia-smi also includes CUDA context.",
+        }
+        self.last_profile = phase_profile
 
         return videos[0] if self.rank == 0 else None
